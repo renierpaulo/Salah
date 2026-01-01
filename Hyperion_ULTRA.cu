@@ -1,29 +1,32 @@
 /*
- * HYPERION ULTRA - 18 GKeys/s with 256-bit precision
+ * HYPERION ULTRA v6 - Maximum Speed (18+ GKeys/s) + 256-bit Range Fix
  * 
- * Based on v8 with minimal changes for 256-bit support.
- * Key: Use v8's exact kernel and init, just add P0 during init.
+ * Target: High-speed search with correct key alignment for Puzzle 71+.
  */
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <chrono>
-
 #include "CUDAMath.h"
 
 #define NUM_BLOCKS 16384
 #define THREADS_PER_BLOCK 256
 #define KEYS_PER_THREAD 4096
+#define DEBUG_INTERVAL 100  // Print debug every N batches
+#define REINIT_INTERVAL 1000  // Reinitialize points every N batches to prevent drift
 
 __device__ __constant__ uint8_t d_target[20];
 __device__ __constant__ uint32_t d_prefix;
 __device__ int d_found = 0;
 __device__ uint64_t d_found_key[4];
-__device__ __constant__ uint64_t d_high[3];
-__device__ __constant__ uint64_t d_baseX[4];
-__device__ __constant__ uint64_t d_baseY[4];
-__device__ __constant__ int d_has_base;
+__device__ __constant__ uint64_t d_range_start[4];
+
+// Debug: track current position with full 256-bit precision
+__device__ uint64_t d_current_key[4];
+__device__ uint64_t d_debug_px[4];  // Sample point X for verification
+__device__ uint64_t d_debug_py[4];  // Sample point Y for verification
+__device__ unsigned long long d_infinity_count = 0;  // Track infinity points (error indicator)
 
 __device__ __constant__ uint32_t K_SHA[64] = {
     0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
@@ -131,8 +134,38 @@ __device__ __forceinline__ void ripemd160_32_inline(const uint32_t* sha_state, u
     hash20[16]=h4;hash20[17]=h4>>8;hash20[18]=h4>>16;hash20[19]=h4>>24;
 }
 
-// v8 kernel with 256-bit key output
-__global__ void kernel_v8(uint64_t* d_px, uint64_t* d_py, uint64_t start_key, unsigned long long* d_count) {
+// Helper: 256-bit addition with full carry propagation
+__device__ __forceinline__ void add256(uint64_t r[4], const uint64_t a[4], uint64_t b) {
+    r[0] = a[0] + b;
+    uint64_t c = (r[0] < a[0]) ? 1ULL : 0ULL;
+    r[1] = a[1] + c;
+    c = (r[1] < a[1]) ? 1ULL : 0ULL;
+    r[2] = a[2] + c;
+    c = (r[2] < a[2]) ? 1ULL : 0ULL;
+    r[3] = a[3] + c;
+}
+
+// Helper: 256-bit addition of two 256-bit numbers
+__device__ __forceinline__ void add256_full(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]) {
+    uint64_t c = 0;
+    r[0] = a[0] + b[0];
+    c = (r[0] < a[0]) ? 1ULL : 0ULL;
+    
+    uint64_t tmp = a[1] + c;
+    c = (tmp < a[1]) ? 1ULL : 0ULL;
+    r[1] = tmp + b[1];
+    c += (r[1] < tmp) ? 1ULL : 0ULL;
+    
+    tmp = a[2] + c;
+    c = (tmp < a[2]) ? 1ULL : 0ULL;
+    r[2] = tmp + b[2];
+    c += (r[2] < tmp) ? 1ULL : 0ULL;
+    
+    r[3] = a[3] + b[3] + c;
+}
+
+__global__ void kernel_v6(uint64_t* d_px, uint64_t* d_py, unsigned long long* d_count, 
+                          uint64_t batch_offset_lo, uint64_t batch_offset_hi) {
     const uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (d_found) return;
 
@@ -140,14 +173,20 @@ __global__ void kernel_v8(uint64_t* d_px, uint64_t* d_py, uint64_t start_key, un
     px[0] = d_px[tid*4]; px[1] = d_px[tid*4+1]; px[2] = d_px[tid*4+2]; px[3] = d_px[tid*4+3];
     py[0] = d_py[tid*4]; py[1] = d_py[tid*4+1]; py[2] = d_py[tid*4+2]; py[3] = d_py[tid*4+3];
 
-    uint64_t key = start_key + tid;
     unsigned long long local_count = 0;
+    ECPointA G; pointSetG(G);
 
-    ECPointA G;
-    pointSetG(G);
-
+    // Check if point is valid (not zero/infinity) before processing
+    bool point_valid = !((px[0] | px[1] | px[2] | px[3]) == 0 && (py[0] | py[1] | py[2] | py[3]) == 0);
+    
     #pragma unroll 4
     for (int iter = 0; iter < KEYS_PER_THREAD && !d_found; iter++) {
+        // Skip if point became invalid
+        if (!point_valid) {
+            atomicAdd(&d_infinity_count, 1ULL);
+            break;
+        }
+        
         uint8_t parity = (py[0] & 1) ? 0x03 : 0x02;
         uint32_t sha_state[8];
         sha256_33_inline(px, parity, sha_state);
@@ -157,216 +196,266 @@ __global__ void kernel_v8(uint64_t* d_px, uint64_t* d_py, uint64_t start_key, un
 
         if (*(uint32_t*)hash == d_prefix) {
             bool match = true;
-            #pragma unroll
-            for (int k = 0; k < 20; k++) {
-                if (hash[k] != d_target[k]) { match = false; break; }
-            }
+            for (int k = 0; k < 20; k++) if (hash[k] != d_target[k]) { match = false; break; }
             if (match && atomicCAS(&d_found, 0, 1) == 0) {
-                d_found_key[0] = key;
-                d_found_key[1] = d_high[0];
-                d_found_key[2] = d_high[1];
-                d_found_key[3] = d_high[2];
+                // Calculate full 256-bit key with proper carry propagation
+                // total_offset = batch_offset + tid * KEYS_PER_THREAD + iter
+                uint64_t thread_offset = tid * KEYS_PER_THREAD + iter;
+                uint64_t batch_off[4] = {batch_offset_lo, batch_offset_hi, 0, 0};
+                
+                // Add thread_offset to batch_offset
+                uint64_t total_off[4];
+                add256(total_off, batch_off, thread_offset);
+                
+                // Add to range_start
+                add256_full(d_found_key, (uint64_t*)d_range_start, total_off);
             }
         }
-
+        
         ECPointA P, R;
         P.X[0]=px[0]; P.X[1]=px[1]; P.X[2]=px[2]; P.X[3]=px[3];
         P.Y[0]=py[0]; P.Y[1]=py[1]; P.Y[2]=py[2]; P.Y[3]=py[3];
+        P.infinity = false;
         pointAddAffine(P, G, R);
-        px[0]=R.X[0]; px[1]=R.X[1]; px[2]=R.X[2]; px[3]=R.X[3];
-        py[0]=R.Y[0]; py[1]=R.Y[1]; py[2]=R.Y[2]; py[3]=R.Y[3];
-        key++;
+        
+        // Check if result is infinity (would indicate P = -G, very rare but possible)
+        if (R.infinity) {
+            point_valid = false;
+            atomicAdd(&d_infinity_count, 1ULL);
+            // Set point to G to continue (skip one key)
+            px[0]=G.X[0]; px[1]=G.X[1]; px[2]=G.X[2]; px[3]=G.X[3];
+            py[0]=G.Y[0]; py[1]=G.Y[1]; py[2]=G.Y[2]; py[3]=G.Y[3];
+        } else {
+            px[0]=R.X[0]; px[1]=R.X[1]; px[2]=R.X[2]; px[3]=R.X[3];
+            py[0]=R.Y[0]; py[1]=R.Y[1]; py[2]=R.Y[2]; py[3]=R.Y[3];
+        }
     }
-
     d_px[tid*4]=px[0]; d_px[tid*4+1]=px[1]; d_px[tid*4+2]=px[2]; d_px[tid*4+3]=px[3];
     d_py[tid*4]=py[0]; d_py[tid*4+1]=py[1]; d_py[tid*4+2]=py[2]; d_py[tid*4+3]=py[3];
     atomicAdd(d_count, local_count);
+    
+    // Debug: thread 0 saves its current point for verification
+    if (tid == 0) {
+        d_debug_px[0] = px[0]; d_debug_px[1] = px[1]; d_debug_px[2] = px[2]; d_debug_px[3] = px[3];
+        d_debug_py[0] = py[0]; d_debug_py[1] = py[1]; d_debug_py[2] = py[2]; d_debug_py[3] = py[3];
+        
+        // Calculate and store current key position
+        uint64_t batch_off[4] = {batch_offset_lo, batch_offset_hi, 0, 0};
+        uint64_t thread_end = (uint64_t)KEYS_PER_THREAD;
+        uint64_t total_off[4];
+        add256(total_off, batch_off, thread_end);
+        add256_full(d_current_key, (uint64_t*)d_range_start, total_off);
+    }
 }
 
-// v8 init with optional base point addition
-__global__ void init_pts(uint64_t* d_px, uint64_t* d_py, uint64_t start) {
+// Initialize points with full 256-bit offset support
+__global__ void init_pts_256_with_offset(uint64_t* d_px, uint64_t* d_py, 
+                                          uint64_t offset_lo, uint64_t offset_hi) {
     const uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t key = start + tid;
-    uint64_t s[4] = {key, 0, 0, 0};
-    ECPointA P, R;
-    pointSetG(P);
-    pointSetInfinity(R);
-    bool first = true;
-    for (int b = 0; b < 64; b++) {
-        if (s[0] & (1ULL << b)) {
-            if (first) { R = P; first = false; }
-            else { ECPointA t; pointAddAffine(R, P, t); R = t; }
+    uint64_t key[4];
+    
+    // Calculate: key = range_start + offset + tid * KEYS_PER_THREAD
+    // Step 1: Add tid * KEYS_PER_THREAD to offset
+    uint64_t thread_offset = tid * KEYS_PER_THREAD;
+    uint64_t total_lo = offset_lo + thread_offset;
+    uint64_t total_hi = offset_hi + ((total_lo < offset_lo) ? 1ULL : 0ULL);
+    
+    // Step 2: Add to range_start with full carry propagation
+    key[0] = d_range_start[0] + total_lo;
+    uint64_t c = (key[0] < d_range_start[0]) ? 1ULL : 0ULL;
+    
+    uint64_t tmp = d_range_start[1] + c;
+    c = (tmp < d_range_start[1]) ? 1ULL : 0ULL;
+    key[1] = tmp + total_hi;
+    c += (key[1] < tmp) ? 1ULL : 0ULL;
+    
+    key[2] = d_range_start[2] + c;
+    c = (key[2] < d_range_start[2]) ? 1ULL : 0ULL;
+    
+    key[3] = d_range_start[3] + c;
+
+    // Scalar multiplication: R = key * G
+    ECPointA P, R; pointSetG(P); pointSetInfinity(R);
+    for (int limb = 0; limb < 4; limb++) {
+        uint64_t v = key[limb];
+        for (int b = 0; b < 64; b++) {
+            if (v & (1ULL << b)) {
+                if (R.infinity) { R = P; } else { ECPointA t; pointAddAffine(R, P, t); R = t; }
+            }
+            ECPointA t; pointDoubleAffine(P, t); P = t;
         }
-        ECPointA t; pointDoubleAffine(P, t); P = t;
     }
     
-    // Add base point if present
-    if (d_has_base && !R.infinity) {
-        ECPointA B, Final;
-        B.X[0]=d_baseX[0]; B.X[1]=d_baseX[1]; B.X[2]=d_baseX[2]; B.X[3]=d_baseX[3];
-        B.Y[0]=d_baseY[0]; B.Y[1]=d_baseY[1]; B.Y[2]=d_baseY[2]; B.Y[3]=d_baseY[3];
-        B.infinity = false;
-        pointAddAffine(R, B, Final);
-        R = Final;
-    } else if (d_has_base && R.infinity) {
-        R.X[0]=d_baseX[0]; R.X[1]=d_baseX[1]; R.X[2]=d_baseX[2]; R.X[3]=d_baseX[3];
-        R.Y[0]=d_baseY[0]; R.Y[1]=d_baseY[1]; R.Y[2]=d_baseY[2]; R.Y[3]=d_baseY[3];
-        R.infinity = false;
+    // Store result (handle infinity case)
+    if (R.infinity) {
+        // This shouldn't happen for valid keys, but handle it
+        pointSetG(R);  // Reset to G as fallback
     }
     
     d_px[tid*4]=R.X[0]; d_px[tid*4+1]=R.X[1]; d_px[tid*4+2]=R.X[2]; d_px[tid*4+3]=R.X[3];
     d_py[tid*4]=R.Y[0]; d_py[tid*4+1]=R.Y[1]; d_py[tid*4+2]=R.Y[2]; d_py[tid*4+3]=R.Y[3];
 }
 
+// Legacy init wrapper (host function)
+void launch_init_pts_256(uint64_t* d_px, uint64_t* d_py) {
+    init_pts_256_with_offset<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(d_px, d_py, 0, 0);
+}
+
 bool parseHash160(const char* hex, uint8_t* h) {
     if (strlen(hex) != 40) return false;
-    for (int i = 0; i < 20; i++) { unsigned int b; if (sscanf(hex+i*2, "%2x", &b) != 1) return false; h[i] = b; }
+    for (int i = 0; i < 20; i++) { unsigned int b; sscanf(hex+i*2, "%2x", &b); h[i] = b; }
     return true;
 }
 
 bool parseHex256(const char* hex, uint64_t* limbs) {
-    limbs[0] = limbs[1] = limbs[2] = limbs[3] = 0;
-    int len = strlen(hex);
-    if (len > 64) return false;
-    char padded[65] = {0};
-    int pad = 64 - len;
-    for (int i = 0; i < pad; i++) padded[i] = '0';
-    strcpy(padded + pad, hex);
-    for (int i = 0; i < 4; i++) {
-        char chunk[17] = {0};
-        strncpy(chunk, padded + i * 16, 16);
-        limbs[3-i] = strtoull(chunk, NULL, 16);
-    }
+    limbs[0]=limbs[1]=limbs[2]=limbs[3]=0;
+    int len = strlen(hex); if (len > 64) return false;
+    char padded[65] = {0}; memset(padded, '0', 64-len); strcpy(padded+64-len, hex);
+    for (int i=0; i<4; i++) { char chunk[17]={0}; strncpy(chunk, padded+i*16, 16); limbs[3-i] = strtoull(chunk, NULL, 16); }
     return true;
 }
 
-void printKey256(const char* label, uint64_t* k) {
-    printf("%s", label);
-    bool started = false;
-    for (int i = 3; i >= 0; i--) {
-        if (k[i] || started || i == 0) {
-            if (started) printf("%016llx", (unsigned long long)k[i]);
-            else { printf("%llx", (unsigned long long)k[i]); started = true; }
-        }
-    }
-    printf("\n");
-}
-
 int main(int argc, char** argv) {
-    printf("\n");
-    printf("╔═══════════════════════════════════════════════════════════════╗\n");
-    printf("║      HYPERION ULTRA - 18 GKeys/s @ 256-bit Precision          ║\n");
-    printf("╚═══════════════════════════════════════════════════════════════╝\n\n");
-    
-    const char* hx = nullptr;
-    uint64_t rs[4] = {0}, re[4] = {0};
-    
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--hash160") == 0 && i+1 < argc) hx = argv[++i];
-        else if (strcmp(argv[i], "--range") == 0 && i+1 < argc) {
-            char* a = argv[++i];
-            char* c = strchr(a, ':');
-            if (c) {
-                char s[128]={0}, e[128]={0};
-                strncpy(s, a, c-a);
-                strcpy(e, c+1);
-                parseHex256(s, rs);
-                parseHex256(e, re);
-            }
-        }
+    const char *hx=nullptr, *range=nullptr;
+    for (int i=1; i<argc; i++) {
+        if (strcmp(argv[i], "--hash160") == 0) hx = argv[++i];
+        else if (strcmp(argv[i], "--range") == 0) range = argv[++i];
     }
-    
-    if (!hx) { printf("Usage: %s --hash160 <40-hex> --range <start:end>\n", argv[0]); return 1; }
-    
-    uint8_t tgt[20];
-    if (!parseHash160(hx, tgt)) { printf("Invalid hash160\n"); return 1; }
-    
-    printf("Target: %s\n", hx);
-    printKey256("Start:  ", rs);
-    printKey256("End:    ", re);
-    
+    if (!hx || !range) { printf("Usage: %s --hash160 <hex> --range <start:end>\n", argv[0]); return 1; }
+    uint64_t rs[4], re[4]; char s[128]={0}, e[128]={0}; char* c = strchr((char*)range, ':');
+    strncpy(s, range, c-range); strcpy(e, c+1); parseHex256(s, rs); parseHex256(e, re);
+    uint8_t tgt[20]; parseHash160(hx, tgt);
+
     uint64_t thr = (uint64_t)NUM_BLOCKS * THREADS_PER_BLOCK;
-    uint64_t kpl = thr * KEYS_PER_THREAD;
-    printf("Config: %llu threads × %d keys = %llu keys/launch\n\n", 
-           (unsigned long long)thr, KEYS_PER_THREAD, (unsigned long long)kpl);
-    
-    uint64_t high[3] = {rs[1], rs[2], rs[3]};
-    cudaMemcpyToSymbol(d_high, high, 3 * sizeof(uint64_t));
+    cudaMemcpyToSymbol(d_range_start, rs, 32);
     cudaMemcpyToSymbol(d_target, tgt, 20);
-    uint32_t pfx = *(uint32_t*)tgt;
-    cudaMemcpyToSymbol(d_prefix, &pfx, 4);
-    int z = 0;
-    cudaMemcpyToSymbol(d_found, &z, sizeof(int));
-    
-    // Compute base point if high bits present
-    int has_base = (rs[1] != 0 || rs[2] != 0 || rs[3] != 0) ? 1 : 0;
-    cudaMemcpyToSymbol(d_has_base, &has_base, sizeof(int));
-    
-    if (has_base) {
-        printf("Computing base point (high_bits × G)...\n");
-        uint64_t base_key[4] = {0, rs[1], rs[2], rs[3]};
-        uint64_t baseX[4], baseY[4];
-        uint64_t *d_s, *d_ox, *d_oy;
-        cudaMalloc(&d_s, 4 * sizeof(uint64_t));
-        cudaMalloc(&d_ox, 4 * sizeof(uint64_t));
-        cudaMalloc(&d_oy, 4 * sizeof(uint64_t));
-        cudaMemcpy(d_s, base_key, 4 * sizeof(uint64_t), cudaMemcpyHostToDevice);
-        scalarMulKernelBase<<<1, 1>>>(d_s, d_ox, d_oy, 1);
-        cudaDeviceSynchronize();
-        cudaMemcpy(baseX, d_ox, 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost);
-        cudaMemcpy(baseY, d_oy, 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost);
-        cudaFree(d_s); cudaFree(d_ox); cudaFree(d_oy);
-        cudaMemcpyToSymbol(d_baseX, baseX, 4 * sizeof(uint64_t));
-        cudaMemcpyToSymbol(d_baseY, baseY, 4 * sizeof(uint64_t));
-    }
-    
-    uint64_t *d_px, *d_py;
-    cudaMalloc(&d_px, thr * 4 * sizeof(uint64_t));
-    cudaMalloc(&d_py, thr * 4 * sizeof(uint64_t));
-    unsigned long long* d_cnt;
-    cudaMalloc(&d_cnt, sizeof(unsigned long long));
-    unsigned long long uz = 0;
-    cudaMemcpy(d_cnt, &uz, sizeof(unsigned long long), cudaMemcpyHostToDevice);
-    
-    printf("Init %llu pts...\n", (unsigned long long)thr);
-    fflush(stdout);
-    auto t1 = std::chrono::steady_clock::now();
-    init_pts<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(d_px, d_py, rs[0]);
+    uint32_t pfx = *(uint32_t*)tgt; cudaMemcpyToSymbol(d_prefix, &pfx, 4);
+
+    uint64_t *d_px, *d_py; cudaMalloc(&d_px, thr*32); cudaMalloc(&d_py, thr*32);
+    unsigned long long* d_cnt; cudaMalloc(&d_cnt, 8);
+    unsigned long long uz = 0; cudaMemcpy(d_cnt, &uz, 8, cudaMemcpyHostToDevice);
+
+    printf("HYPERION v6 - Ultra Speed + Debug\n");
+    printf("Initializing %llu EC points...\n", thr);
+    init_pts_256_with_offset<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(d_px, d_py, 0, 0);
     cudaDeviceSynchronize();
-    auto t2 = std::chrono::steady_clock::now();
-    printf("Init: %.2fs\n\n", std::chrono::duration<double>(t2-t1).count());
     
-    printf("🚀 SEARCHING!\n\n");
-    fflush(stdout);
-    
-    auto start = std::chrono::steady_clock::now();
+    cudaError_t init_err = cudaGetLastError();
+    if (init_err != cudaSuccess) {
+        printf("\n❌ Init CUDA Error: %s\n", cudaGetErrorString(init_err));
+        return 1;
+    }
+    printf("✅ Points initialized\n");
+
+    auto start_time = std::chrono::steady_clock::now();
     int found = 0;
-    uint64_t start_key = rs[0];
+    
+    // Use 128-bit batch offset (two uint64_t) for proper range handling
+    uint64_t batch_offset_lo = 0;
+    uint64_t batch_offset_hi = 0;
+    const uint64_t keys_per_batch = thr * KEYS_PER_THREAD;  // ~17 billion per batch
+    
+    int batch_count = 0;
+    uint64_t last_debug_total = 0;
+    
+    printf("\n🔍 Starting search...\n");
+    printf("   Keys per batch: %llu (~%.2f billion)\n", keys_per_batch, keys_per_batch / 1e9);
+    printf("   Range start: %016llx%016llx%016llx%016llx\n", rs[3], rs[2], rs[1], rs[0]);
+    printf("   Range end:   %016llx%016llx%016llx%016llx\n\n", re[3], re[2], re[1], re[0]);
     
     while (!found) {
-        kernel_v8<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(d_px, d_py, start_key, d_cnt);
+        kernel_v6<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(d_px, d_py, d_cnt, batch_offset_lo, batch_offset_hi);
         cudaDeviceSynchronize();
         
-        cudaMemcpyFromSymbol(&found, d_found, sizeof(int));
+        // Check for CUDA errors
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            printf("\n❌ CUDA Error: %s\n", cudaGetErrorString(err));
+            break;
+        }
         
-        unsigned long long total;
-        cudaMemcpy(&total, d_cnt, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
-        
+        cudaMemcpyFromSymbol(&found, d_found, 4);
+        unsigned long long total; cudaMemcpy(&total, d_cnt, 8, cudaMemcpyDeviceToHost);
         auto now = std::chrono::steady_clock::now();
-        double elapsed = std::chrono::duration<double>(now - start).count();
-        double speed = total / elapsed / 1e9;
+        double elapsed = std::chrono::duration<double>(now - start_time).count();
         
-        printf("\r⚡ [%.2f GKeys/s] %llu keys   ", speed, total);
-        fflush(stdout);
+        // Update batch offset with carry propagation
+        uint64_t old_lo = batch_offset_lo;
+        batch_offset_lo += keys_per_batch;
+        if (batch_offset_lo < old_lo) {
+            batch_offset_hi++;  // Carry to high 64-bits
+        }
         
-        start_key += kpl;
+        batch_count++;
+        
+        // Detailed debug output every N batches
+        if (batch_count % DEBUG_INTERVAL == 0) {
+            uint64_t cur_key[4], dbg_px[4], dbg_py[4];
+            unsigned long long inf_count;
+            cudaMemcpyFromSymbol(cur_key, d_current_key, 32);
+            cudaMemcpyFromSymbol(dbg_px, d_debug_px, 32);
+            cudaMemcpyFromSymbol(dbg_py, d_debug_py, 32);
+            cudaMemcpyFromSymbol(&inf_count, d_infinity_count, 8);
+            
+            double keys_since_last = (double)(total - last_debug_total);
+            double current_speed = keys_since_last / (elapsed > 0 ? (DEBUG_INTERVAL * (elapsed / batch_count)) : 1) / 1e9;
+            
+            printf("\n📊 [Batch %d] Debug Info:\n", batch_count);
+            printf("   Current Key:  %016llx%016llx%016llx%016llx\n", cur_key[3], cur_key[2], cur_key[1], cur_key[0]);
+            printf("   Batch Offset: %016llx%016llx (hi:lo)\n", batch_offset_hi, batch_offset_lo);
+            printf("   Point X[0]:   %016llx (sanity check)\n", dbg_px[0]);
+            printf("   Point Y[0]:   %016llx (sanity check)\n", dbg_py[0]);
+            printf("   Speed: %.2f GKeys/s | Total: %.2f billion keys\n", current_speed, total / 1e9);
+            printf("   Infinity/Error count: %llu\n", inf_count);
+            
+            // Sanity check: verify point is not zero (would indicate error)
+            if (dbg_px[0] == 0 && dbg_px[1] == 0 && dbg_px[2] == 0 && dbg_px[3] == 0) {
+                printf("   ⚠️  WARNING: Point X is ZERO! Possible EC arithmetic error!\n");
+            }
+            if (dbg_py[0] == 0 && dbg_py[1] == 0 && dbg_py[2] == 0 && dbg_py[3] == 0) {
+                printf("   ⚠️  WARNING: Point Y is ZERO! Possible EC arithmetic error!\n");
+            }
+            
+            // Check for infinity errors
+            if (inf_count > 0) {
+                printf("   ⚠️  WARNING: %llu threads hit infinity point! EC arithmetic issue detected!\n", inf_count);
+            }
+            
+            // Check if we're making progress (keys should increase)
+            if (total == last_debug_total && batch_count > DEBUG_INTERVAL) {
+                printf("   ❌ ERROR: No progress! Keys count stuck at %llu\n", total);
+            }
+            
+            last_debug_total = total;
+            
+            // Periodic reinitialization to prevent accumulated errors
+            if (batch_count % REINIT_INTERVAL == 0) {
+                printf("🔄 Reinitializing points to prevent drift...\n");
+                
+                // Reset infinity counter
+                unsigned long long zero = 0;
+                cudaMemcpyToSymbol(d_infinity_count, &zero, 8);
+                
+                // Reinitialize all points at current offset
+                init_pts_256_with_offset<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(d_px, d_py, batch_offset_lo, batch_offset_hi);
+                cudaDeviceSynchronize();
+                
+                cudaError_t reinit_err = cudaGetLastError();
+                if (reinit_err != cudaSuccess) {
+                    printf("   ❌ Reinit CUDA Error: %s\n", cudaGetErrorString(reinit_err));
+                } else {
+                    printf("   ✅ Points reinitialized at offset %llx:%llx\n", batch_offset_hi, batch_offset_lo);
+                }
+            }
+        } else {
+            printf("\r⚡ [%.2f GKeys/s] Total: %.2f B | Batch: %d | Offset: %llx:%llx   ", 
+                   total/elapsed/1e9, total/1e9, batch_count, batch_offset_hi, batch_offset_lo);
+            fflush(stdout);
+        }
     }
-    
-    printf("\n\n*** FOUND! ***\n");
-    uint64_t fk[4];
-    cudaMemcpyFromSymbol(fk, d_found_key, sizeof(uint64_t)*4);
-    printKey256("Key: ", fk);
-    
-    cudaFree(d_px); cudaFree(d_py); cudaFree(d_cnt);
+    if (found) {
+        uint64_t fk[4]; cudaMemcpyFromSymbol(fk, d_found_key, 32);
+        printf("\nFOUND! Key: %llx%016llx%016llx%016llx\n", fk[3], fk[2], fk[1], fk[0]);
+    }
     return 0;
 }
