@@ -17,6 +17,11 @@
 #define THREADS_PER_BLOCK 256
 #define BATCH_SIZE 256
 
+// CUDAMath.h expects GRP_SIZE (used in internal sizing macros)
+#ifndef GRP_SIZE
+#define GRP_SIZE 1024
+#endif
+
 #include "CUDAUtils.h"
 #include "CUDAMath_Jacobian_Fixed.h"
 #include "CUDAMath_WorldClass.h"
@@ -58,7 +63,9 @@ __device__ unsigned long long d_time_point_add = 0;
 __device__ unsigned long long d_time_hash = 0;
 __device__ unsigned long long d_time_check = 0;
 
+#if ECC_PREVENT_DCE
 __device__ unsigned long long d_ecc_sink = 0;
+#endif
 
 __global__ void precompute_g_multiples_kernel(uint64_t* gx, uint64_t* gy) {
     const int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
@@ -204,7 +211,9 @@ kernel_profiled_genius_ecc_only(
 
     unsigned long long lc = 0;
     unsigned long long local_cycles = 0;
+#if ECC_PREVENT_DCE
     unsigned long long sink_acc = 0;
+#endif
 
     // Cache Q = (tid+1)*G once (affine)
     uint64_t QX[4], QY[4];
@@ -242,7 +251,9 @@ kernel_profiled_genius_ecc_only(
         pointAddJacobianMixed_XY_Hot(P, QX, QY, R);
 
         // Prevent dead-code elimination (cheap): only use one word from R in block0/tid0
+#if ECC_PREVENT_DCE
         if(bid == 0 && tid == 0) sink_acc ^= (unsigned long long)R.X[0];
+#endif
 
         if(tid == 0) {
             t1 = clock64();
@@ -268,7 +279,9 @@ kernel_profiled_genius_ecc_only(
     if(tid == 0) {
         // Only accumulate representative timing from block 0 to keep "cycles per point" meaningful
         if(bid == 0) atomicAdd(&d_time_point_add, local_cycles);
+#if ECC_PREVENT_DCE
         if(bid == 0) atomicXor(&d_ecc_sink, sink_acc);
+#endif
     }
 
     // Store updated base back to global (one point per block)
