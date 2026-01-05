@@ -203,6 +203,15 @@ __global__ void kernel_ultra(uint64_t* __restrict__ d_px, uint64_t* __restrict__
     if(lane == 0) atomicAdd(d_count, lc);
 }
 
+__global__ void compute_g_multiples(uint64_t* gx, uint64_t* gy) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= BATCH_SIZE) return;
+    uint64_t key[4] = {(uint64_t)(tid + 1), 0, 0, 0};
+    uint64_t ox[4], oy[4];
+    scalarMulBaseAffine(key, ox, oy);
+    for(int i=0; i<4; i++) { gx[tid*4+i] = ox[i]; gy[tid*4+i] = oy[i]; }
+}
+
 void initGMultiples() {
     uint64_t* h_gx = new uint64_t[BATCH_SIZE * 4];
     uint64_t* h_gy = new uint64_t[BATCH_SIZE * 4];
@@ -210,33 +219,7 @@ void initGMultiples() {
     cudaMalloc(&d_gx, BATCH_SIZE * 4 * sizeof(uint64_t));
     cudaMalloc(&d_gy, BATCH_SIZE * 4 * sizeof(uint64_t));
 
-    for (int i = 0; i < BATCH_SIZE; i++) {
-        uint64_t key[4] = {(uint64_t)(i + 1), 0, 0, 0};
-        uint64_t ox[4], oy[4];
-        
-        uint64_t* d_k; cudaMalloc(&d_k, 32);
-        uint64_t* d_ox; cudaMalloc(&d_ox, 32);
-        uint64_t* d_oy; cudaMalloc(&d_oy, 32);
-        cudaMemcpy(d_k, key, 32, cudaMemcpyHostToDevice);
-        
-        auto kern = [=] __device__ (uint64_t* k, uint64_t* ox, uint64_t* oy) {
-            scalarMulBaseAffine(k, ox, oy);
-        };
-        
-        cudaMemcpy(d_k, key, 32, cudaMemcpyHostToDevice);
-        cudaFree(d_k); cudaFree(d_ox); cudaFree(d_oy);
-    }
-
-    // Use kernel to compute
-    auto compute = [] __global__ (uint64_t* gx, uint64_t* gy) {
-        int tid = blockIdx.x * blockDim.x + threadIdx.x;
-        if (tid >= BATCH_SIZE) return;
-        uint64_t key[4] = {(uint64_t)(tid + 1), 0, 0, 0};
-        uint64_t ox[4], oy[4];
-        scalarMulBaseAffine(key, ox, oy);
-        for(int i=0; i<4; i++) { gx[tid*4+i] = ox[i]; gy[tid*4+i] = oy[i]; }
-    };
-    compute<<<1, BATCH_SIZE>>>(d_gx, d_gy);
+    compute_g_multiples<<<1, BATCH_SIZE>>>(d_gx, d_gy);
     cudaDeviceSynchronize();
     
     cudaMemcpy(h_gx, d_gx, BATCH_SIZE * 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost);
