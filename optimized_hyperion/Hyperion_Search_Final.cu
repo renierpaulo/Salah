@@ -328,6 +328,15 @@ int main(int argc, char** argv) {
     if (!parseHex256(s, rs) || !parseHex256(e, re)) { printf("❌ Invalid range\n"); return 1; }
     if (cmp256_le(rs, re) > 0) { printf("❌ start > end\n"); return 1; }
 
+    // IMPORTANT: Adjust start to avoid point doubling issue when base == G_multiples[i]
+    // This happens when start <= BATCH_SIZE. We need start > BATCH_SIZE.
+    uint64_t min_start = BATCH_SIZE + 1;
+    if (rs[0] < min_start && rs[1] == 0 && rs[2] == 0 && rs[3] == 0) {
+        printf("⚠️  Adjusting start from %llu to %llu (required for point addition)\n", 
+               (unsigned long long)rs[0], (unsigned long long)min_start);
+        rs[0] = min_start;
+    }
+
     uint64_t total_threads = (uint64_t)NUM_BLOCKS * THREADS_PER_BLOCK;
     uint64_t kpl = total_threads * BATCH_SIZE;
 
