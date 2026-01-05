@@ -678,23 +678,62 @@ int main(int argc, char** argv) {
         if (count < 1) count = 1;
         if (count > 64) count = 64;
 
+        const char* range = nullptr;
+        for (int ai = 1; ai < argc; ai++) {
+            if (strcmp(argv[ai], "-r") == 0 && (ai + 1) < argc) {
+                range = argv[++ai];
+            }
+        }
+
+        uint64_t rs[4] = {1, 0, 0, 0};
+        uint64_t re[4] = {~0ull, ~0ull, ~0ull, ~0ull};
+        if (range) {
+            char s[128]={0}, e[128]={0};
+            char* c = strchr((char*)range, ':');
+            if (!c) {
+                printf("❌ Range inválido. Use -r start:end (hex)\n");
+                return 1;
+            }
+            strncpy(s, range, c-range);
+            strcpy(e, c+1);
+            if (!parseHex256(s, rs) || !parseHex256(e, re)) {
+                printf("❌ Range inválido. Use -r start:end (hex)\n");
+                return 1;
+            }
+            if (cmp256_le(rs, re) > 0) {
+                printf("❌ Range inválido: start > end\n");
+                return 1;
+            }
+        }
+
         initGMultiples();
 
         uint64_t h_keys[64 * 4] = {0};
+
+        int actual = 0;
         for (int i = 0; i < count; i++) {
-            h_keys[i * 4 + 0] = (uint64_t)(i + 1);
-            h_keys[i * 4 + 1] = 0;
-            h_keys[i * 4 + 2] = 0;
-            h_keys[i * 4 + 3] = 0;
+            uint64_t k[4] = { rs[0], rs[1], rs[2], rs[3] };
+            add_u64_to_256(k, (uint64_t)i);
+            if (cmp256_le(k, re) > 0) break;
+            h_keys[actual * 4 + 0] = k[0];
+            h_keys[actual * 4 + 1] = k[1];
+            h_keys[actual * 4 + 2] = k[2];
+            h_keys[actual * 4 + 3] = k[3];
+            actual++;
+        }
+
+        if (actual == 0) {
+            printf("❌ Range muito pequeno para gerar samples (start já > end)\n");
+            return 1;
         }
 
         uint64_t* d_keys = nullptr;
         uint8_t* d_hash = nullptr;
-        cudaMalloc(&d_keys, (size_t)count * 4 * sizeof(uint64_t));
-        cudaMalloc(&d_hash, (size_t)count * 20 * sizeof(uint8_t));
-        cudaMemcpy(d_keys, h_keys, (size_t)count * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice);
+        cudaMalloc(&d_keys, (size_t)actual * 4 * sizeof(uint64_t));
+        cudaMalloc(&d_hash, (size_t)actual * 20 * sizeof(uint8_t));
+        cudaMemcpy(d_keys, h_keys, (size_t)actual * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice);
 
-        kernel_samples_hash160<<<1, 64>>>(d_keys, d_hash, count);
+        kernel_samples_hash160<<<1, 64>>>(d_keys, d_hash, actual);
         cudaError_t err = cudaDeviceSynchronize();
         if (err != cudaSuccess) {
             printf("❌ CUDA Error during samples: %s\n", cudaGetErrorString(err));
@@ -702,10 +741,10 @@ int main(int argc, char** argv) {
         }
 
         uint8_t h_hash[64 * 20] = {0};
-        cudaMemcpy(h_hash, d_hash, (size_t)count * 20 * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_hash, d_hash, (size_t)actual * 20 * sizeof(uint8_t), cudaMemcpyDeviceToHost);
 
         printf("Samples (privkey -> hash160, compressed pubkey):\n");
-        for (int i = 0; i < count; i++) {
+        for (int i = 0; i < actual; i++) {
             uint64_t k[4] = { h_keys[i*4+0], h_keys[i*4+1], h_keys[i*4+2], h_keys[i*4+3] };
             printKey256("  priv=0x", k);
             printHash160("  hash160=", &h_hash[i * 20]);
