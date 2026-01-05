@@ -94,6 +94,30 @@ __device__ unsigned long long d_time_check = 0;
 __device__ unsigned long long d_ecc_sink = 0;
 #endif
 
+static __forceinline__ int cmp256_le(const uint64_t a[4], const uint64_t b[4]) {
+    for (int i = 3; i >= 0; --i) {
+        if (a[i] < b[i]) return -1;
+        if (a[i] > b[i]) return 1;
+    }
+    return 0;
+}
+
+static __forceinline__ void add_u64_to_256(uint64_t a[4], uint64_t add) {
+    unsigned __int128 r0 = (unsigned __int128)a[0] + (uint64_t)add;
+    a[0] = (uint64_t)r0;
+    unsigned __int128 carry = r0 >> 64;
+    if (!carry) return;
+    unsigned __int128 r1 = (unsigned __int128)a[1] + (uint64_t)carry;
+    a[1] = (uint64_t)r1;
+    carry = r1 >> 64;
+    if (!carry) return;
+    unsigned __int128 r2 = (unsigned __int128)a[2] + (uint64_t)carry;
+    a[2] = (uint64_t)r2;
+    carry = r2 >> 64;
+    if (!carry) return;
+    a[3] += (uint64_t)carry;
+}
+
 __global__ void precompute_g_multiples_kernel(uint64_t* gx, uint64_t* gy) {
     const int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (tid >= BATCH_SIZE) return;
@@ -693,19 +717,50 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    const char *hx = "f6f5431d25bbf7b12e8add9af5e3475c44a0a5b8";
-    const char *range = "1:100000";
+    const char* hx = "f6f5431d25bbf7b12e8add9af5e3475c44a0a5b8";
+    const char* range = "1:100000";
+
+    for (int ai = 1; ai < argc; ai++) {
+        if (strcmp(argv[ai], "-f") == 0 && (ai + 1) < argc) {
+            hx = argv[++ai];
+        } else if (strcmp(argv[ai], "-r") == 0 && (ai + 1) < argc) {
+            range = argv[++ai];
+        }
+    }
     
     uint64_t rs[4], re[4];
     char s[128]={0}, e[128]={0};
     char* c = strchr((char*)range, ':');
+    if (!c) {
+        printf("❌ Range inválido. Use -r start:end (hex)\n");
+        return 1;
+    }
     strncpy(s, range, c-range);
     strcpy(e, c+1);
-    parseHex256(s, rs);
-    parseHex256(e, re);
+    if (!parseHex256(s, rs) || !parseHex256(e, re)) {
+        printf("❌ Range inválido. Use -r start:end (hex)\n");
+        return 1;
+    }
+    if (cmp256_le(rs, re) > 0) {
+        printf("❌ Range inválido: start > end\n");
+        return 1;
+    }
     
     uint8_t tgt[20];
-    parseHash160(hx, tgt);
+    if (!parseHash160(hx, tgt)) {
+        printf("❌ Hash160 inválido. Use -f <40 hex chars>\n");
+        return 1;
+    }
+
+    printf("Input:\n");
+    printf("  Target (hash160): %s\n", hx);
+    {
+        uint64_t tmp[4];
+        for (int i=0;i<4;i++) tmp[i]=rs[i];
+        printKey256("  Range start: 0x", tmp);
+        for (int i=0;i<4;i++) tmp[i]=re[i];
+        printKey256("  Range end:   0x", tmp);
+    }
 
     initGMultiples();
 
@@ -720,17 +775,9 @@ int main(int argc, char** argv) {
     cudaMemcpyToSymbol(d_found, &z, sizeof(int));
 
     uint64_t *d_px, *d_py;
-    #if PROFILER_ECC_ONLY && ECC_ONLY_PERSIST_JACOBIAN
-    uint64_t *d_pjx = nullptr, *d_pjy = nullptr, *d_pjz = nullptr;
-    #endif
     #if PROFILER_ECC_ONLY
     cudaMalloc(&d_px, (uint64_t)NUM_BLOCKS * 4 * sizeof(uint64_t));
     cudaMalloc(&d_py, (uint64_t)NUM_BLOCKS * 4 * sizeof(uint64_t));
-    #if ECC_ONLY_PERSIST_JACOBIAN
-    cudaMalloc(&d_pjx, (uint64_t)NUM_BLOCKS * 4 * sizeof(uint64_t));
-    cudaMalloc(&d_pjy, (uint64_t)NUM_BLOCKS * 4 * sizeof(uint64_t));
-    cudaMalloc(&d_pjz, (uint64_t)NUM_BLOCKS * 4 * sizeof(uint64_t));
-    #endif
     #else
     cudaMalloc(&d_px, thr * 4 * sizeof(uint64_t));
     cudaMalloc(&d_py, thr * 4 * sizeof(uint64_t));
@@ -760,7 +807,7 @@ int main(int argc, char** argv) {
     printf("Inicializando...\n");
     #if PROFILER_ECC_ONLY
     #if ECC_ONLY_PERSIST_JACOBIAN
-    init_pts_blocks_jacobian<<<NUM_BLOCKS, 1>>>(d_pjx, d_pjy, d_pjz, rs[0], rs[1], rs[2], rs[3]);
+    init_pts_blocks_jacobian<<<NUM_BLOCKS, 1>>>(d_px, d_py, d_pjz, rs[0], rs[1], rs[2], rs[3]);
     #else
     init_pts_blocks<<<NUM_BLOCKS, 1>>>(d_px, d_py, rs[0], rs[1], rs[2], rs[3]);
     #endif
@@ -789,7 +836,8 @@ int main(int argc, char** argv) {
     
     cudaEventRecord(start_event);
     auto start = std::chrono::steady_clock::now();
-    uint64_t batch_lo = rs[0];
+    uint64_t cur[4] = { rs[0], rs[1], rs[2], rs[3] };
+    uint64_t batch_lo = cur[0];
     
     #if PROFILER_ECC_ONLY
     for (int i = 0; i < ECC_ONLY_ITERS; i++) {
@@ -825,7 +873,13 @@ int main(int argc, char** argv) {
         #endif
         fflush(stdout);
         
-        batch_lo += kpl;
+        add_u64_to_256(cur, kpl);
+        batch_lo = cur[0];
+        cudaMemcpyToSymbol(d_key_high, &cur[1], 24);
+        if (cmp256_le(cur, re) > 0) {
+            printf("\n\n✓ Range completo: próximo start > end\n");
+            break;
+        }
     }
     
     cudaEventRecord(stop_event);
