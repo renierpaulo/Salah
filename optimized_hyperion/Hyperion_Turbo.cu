@@ -175,7 +175,9 @@ kernel_turbo(uint64_t* __restrict__ d_px, uint64_t* __restrict__ d_py,
         for(int j=0; j<4; j++) inv[j] = tmp_inv[j];
     }
 
-    // Update base point for next iteration
+    // Update base point for next iteration (DISABLED for speed test)
+    // The profiler doesn't update between iterations - testing if this is the bottleneck
+    #if 0
     int last_idx = BATCH_SIZE - 1;
     uint64_t dx_last[4], dy_last[4], lambda[4], lambda_sq[4], temp[4];
     
@@ -198,6 +200,7 @@ kernel_turbo(uint64_t* __restrict__ d_px, uint64_t* __restrict__ d_py,
         d_px[tid*4 + i] = base_x[i];
         d_py[tid*4 + i] = base_y[i];
     }
+    #endif
     
     // Warp reduction for counter
     for (int offset = 16; offset > 0; offset >>= 1) {
