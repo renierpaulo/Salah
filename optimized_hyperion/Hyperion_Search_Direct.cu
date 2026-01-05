@@ -101,11 +101,12 @@ __global__ void kernel_search_direct(const uint64_t* __restrict__ d_bloom,
         
         lc++;
         
-        // Debug: print first few hashes
+        // Debug: print first few hashes and bloom check result
         if (tid == 0 && i < 5) {
             printf("Key %llu: ", (unsigned long long)key[0]);
             for(int j=0; j<20; j++) printf("%02x", hash[j]);
-            printf("\n");
+            bool bc = bloom_check(hash, d_bloom);
+            printf(" bloom=%s\n", bc ? "YES" : "no");
         }
         
         // Bloom check
