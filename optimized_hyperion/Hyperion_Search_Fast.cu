@@ -138,6 +138,123 @@ __global__ void init_pts_blocks(uint64_t* outX, uint64_t* outY,
 __device__ __forceinline__ void pointAddJacobianG_Hot(const ECPointJ& P, ECPointJ& R);
 __device__ __forceinline__ void pointAddJacobianMixed_XY_Hot(const ECPointJ& P, const uint64_t QX[4], const uint64_t QY[4], ECPointJ& R);
 
+// Batch inversion using Montgomery trick
+__device__ void batchInvBlock(uint64_t* z_array, uint64_t* inv_array, int count) {
+    const int tid = threadIdx.x;
+    
+    // Shared memory for product tree
+    __shared__ uint64_t products[BATCH_SIZE * 4];
+    
+    // Step 1: Build product tree (each thread computes cumulative product)
+    if (tid < count) {
+        uint64_t prod[4];
+        #pragma unroll
+        for(int i=0; i<4; i++) {
+            prod[i] = z_array[tid*4 + i];
+        }
+        
+        // Store initial value
+        #pragma unroll
+        for(int i=0; i<4; i++) {
+            products[tid*4 + i] = prod[i];
+        }
+        
+        // Accumulate products from previous threads
+        for(int j = 1; j <= tid; j *= 2) {
+            __syncthreads();
+            if (tid >= j) {
+                uint64_t prev[4];
+                #pragma unroll
+                for(int i=0; i<4; i++) {
+                    prev[i] = products[(tid-j)*4 + i];
+                }
+                uint64_t temp[4];
+                fieldMul(prod, prev, temp);
+                #pragma unroll
+                for(int i=0; i<4; i++) {
+                    prod[i] = temp[i];
+                }
+            }
+            __syncthreads();
+            #pragma unroll
+            for(int i=0; i<4; i++) {
+                products[tid*4 + i] = prod[i];
+            }
+        }
+    }
+    __syncthreads();
+    
+    // Step 2: Invert the final product (only thread 0)
+    __shared__ uint64_t global_inv[4];
+    if (tid == 0 && count > 0) {
+        uint64_t final_prod[4];
+        #pragma unroll
+        for(int i=0; i<4; i++) {
+            final_prod[i] = products[(count-1)*4 + i];
+        }
+        uint64_t inv[4];
+        fieldInv(final_prod, inv);
+        #pragma unroll
+        for(int i=0; i<4; i++) {
+            global_inv[i] = inv[i];
+        }
+    }
+    __syncthreads();
+    
+    // Step 3: Propagate inversions back (each thread computes its own inverse)
+    if (tid < count) {
+        uint64_t inv[4];
+        #pragma unroll
+        for(int i=0; i<4; i++) {
+            inv[i] = global_inv[i];
+        }
+        
+        // Multiply by inverses of elements after this one
+        for(int j = count - 1; j > tid; j--) {
+            uint64_t z_j[4];
+            #pragma unroll
+            for(int i=0; i<4; i++) {
+                z_j[i] = z_array[j*4 + i];
+            }
+            uint64_t temp[4];
+            fieldMul(inv, z_j, temp);
+            #pragma unroll
+            for(int i=0; i<4; i++) {
+                inv[i] = temp[i];
+            }
+        }
+        
+        // Final inverse for this element
+        if (tid > 0) {
+            uint64_t prod_prev[4];
+            #pragma unroll
+            for(int i=0; i<4; i++) {
+                prod_prev[i] = products[(tid-1)*4 + i];
+            }
+            uint64_t temp[4];
+            fieldMul(inv, prod_prev, temp);
+            #pragma unroll
+            for(int i=0; i<4; i++) {
+                inv_array[tid*4 + i] = temp[i];
+            }
+        } else {
+            // Thread 0: compute 1/z_0 directly
+            uint64_t z_0[4];
+            #pragma unroll
+            for(int i=0; i<4; i++) {
+                z_0[i] = z_array[i];
+            }
+            uint64_t temp[4];
+            fieldInv(z_0, temp);
+            #pragma unroll
+            for(int i=0; i<4; i++) {
+                inv_array[i] = temp[i];
+            }
+        }
+    }
+    __syncthreads();
+}
+
 __global__ void __launch_bounds__(256, 4)
 kernel_search_fast(
     uint64_t* __restrict__ d_px, uint64_t* __restrict__ d_py,
