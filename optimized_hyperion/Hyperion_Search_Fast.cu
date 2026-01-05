@@ -11,7 +11,7 @@
 #include <cstring>
 #include <chrono>
 
-#define NUM_BLOCKS 2048
+#define NUM_BLOCKS 512
 #define THREADS_PER_BLOCK 256
 #define BATCH_SIZE 256
 
