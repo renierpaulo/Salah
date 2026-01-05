@@ -10,7 +10,7 @@
 
 #define NUM_BLOCKS 8192
 #define THREADS_PER_BLOCK 256
-#define BATCH_SIZE 64
+#define BATCH_SIZE 256
 
 #define BLOOM_SIZE_BITS 26
 #define BLOOM_SIZE_BYTES (1ULL << (BLOOM_SIZE_BITS - 3))
@@ -75,7 +75,7 @@ __global__ void init_pts(uint64_t* d_px, uint64_t* d_py, uint64_t s0, uint64_t s
 }
 
 // EXACT profiler kernel - each thread processes BATCH_SIZE points with LOCAL batch inversion
-__global__ void __launch_bounds__(256, 2)
+__global__ void __launch_bounds__(256, 4)
 kernel_turbo(uint64_t* __restrict__ d_px, uint64_t* __restrict__ d_py,
              const uint64_t* __restrict__ d_bloom,
              uint64_t start_key_lo, unsigned long long* __restrict__ d_count) {
@@ -97,6 +97,7 @@ kernel_turbo(uint64_t* __restrict__ d_px, uint64_t* __restrict__ d_py,
     fieldSub(&d_G_multiples_x[0], base_x, dx);
     for(int j=0; j<4; j++) products[0][j] = dx[j];
 
+    #pragma unroll 16
     for(int i=1; i<BATCH_SIZE; i++) {
         fieldSub(&d_G_multiples_x[i*4], base_x, dx);
         fieldMul(products[i-1], dx, products[i]);
@@ -109,6 +110,7 @@ kernel_turbo(uint64_t* __restrict__ d_px, uint64_t* __restrict__ d_py,
     uint64_t inv_dx_last[4];
 
     // Phase 2: Process all points in reverse order
+    #pragma unroll 16
     for(int i=BATCH_SIZE-1; i>=0; i--) {
         uint64_t inv_dx[4];
         if(i > 0) {
@@ -175,9 +177,8 @@ kernel_turbo(uint64_t* __restrict__ d_px, uint64_t* __restrict__ d_py,
         for(int j=0; j<4; j++) inv[j] = tmp_inv[j];
     }
 
-    // Update base point for next iteration (DISABLED for speed test)
-    // The profiler doesn't update between iterations - testing if this is the bottleneck
-    #if 0
+    // Update base point for next iteration
+    #if 1
     int last_idx = BATCH_SIZE - 1;
     uint64_t dx_last[4], dy_last[4], lambda[4], lambda_sq[4], temp[4];
     
