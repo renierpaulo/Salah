@@ -14,9 +14,11 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <chrono>
 #include <vector>
 #include <set>
+#include <string>
 
 #define NUM_BLOCKS 8192
 #define THREADS_PER_BLOCK 256
