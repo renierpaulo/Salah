@@ -15,7 +15,7 @@
 #include <set>
 #include <string>
 
-#define NUM_BLOCKS 8192
+#define NUM_BLOCKS 4096
 #define THREADS_PER_BLOCK 256
 #define BATCH_SIZE 64
 
