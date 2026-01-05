@@ -80,20 +80,20 @@ __device__ __forceinline__ bool prefix_check(const uint8_t hash160[20]) {
 #endif
 }
 
-// QUANTIZED: Optimized bloom check with only 2 hash functions + __ldg
+// QUANTIZED: Optimized bloom check with only 2 hash functions
 __device__ __forceinline__ bool bloom_check_fast(const uint8_t hash160[20], const uint64_t* __restrict__ bloom) {
     // Use first 8 bytes as seed
-    uint64_t seed = __ldg((const uint64_t*)hash160);
+    uint64_t seed = *(const uint64_t*)hash160;
     
     // Hash function 1: direct
     uint64_t bit_idx1 = seed & ((1ULL << BLOOM_SIZE_BITS) - 1);
-    uint64_t word1 = __ldg(&bloom[bit_idx1 >> 6]);
+    uint64_t word1 = bloom[bit_idx1 >> 6];
     if (!(word1 & (1ULL << (bit_idx1 & 63)))) return false;
     
     // Hash function 2: mixed
     uint64_t h2 = seed * 0x9e3779b97f4a7c15ULL;
     uint64_t bit_idx2 = h2 & ((1ULL << BLOOM_SIZE_BITS) - 1);
-    uint64_t word2 = __ldg(&bloom[bit_idx2 >> 6]);
+    uint64_t word2 = bloom[bit_idx2 >> 6];
     if (!(word2 & (1ULL << (bit_idx2 & 63)))) return false;
     
     return true;
