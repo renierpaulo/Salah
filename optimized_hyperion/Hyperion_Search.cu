@@ -58,7 +58,7 @@ static __forceinline__ int cmp256_le(const uint64_t a[4], const uint64_t b[4]) {
     return 0;
 }
 
-static __forceinline__ void add_u64_to_256(uint64_t a[4], uint64_t add) {
+__device__ __host__ static __forceinline__ void add_u64_to_256(uint64_t a[4], uint64_t add) {
     unsigned __int128 r0 = (unsigned __int128)a[0] + (uint64_t)add;
     a[0] = (uint64_t)r0;
     unsigned __int128 carry = r0 >> 64;
