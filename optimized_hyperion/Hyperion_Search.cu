@@ -398,48 +398,6 @@ void initGMultiples() {
     delete[] h_gy;
 }
 
-void initBloomFilter(const char* targets_file) {
-    // Allocate bloom filter on host
-    uint64_t* h_bloom = new uint64_t[BLOOM_SIZE_WORDS];
-    memset(h_bloom, 0, BLOOM_SIZE_BYTES);
-
-    // Load targets and populate bloom filter
-    FILE* f = fopen(targets_file, "r");
-    if (!f) {
-        printf("⚠️  Target file not found, using empty bloom filter\n");
-    } else {
-        char line[128];
-        int count = 0;
-        while (fgets(line, sizeof(line), f)) {
-            // Remove newline
-            line[strcspn(line, "\r\n")] = 0;
-            if (strlen(line) != 40) continue;
-
-            uint8_t hash160[20];
-            if (!parseHash160(line, hash160)) continue;
-
-            // Add to bloom filter
-            uint64_t seed = *(uint64_t*)hash160;
-            uint64_t h1 = seed;
-            uint64_t h2 = seed * 0x9e3779b97f4a7c15ULL;
-            
-            for (int i = 0; i < BLOOM_HASH_COUNT; i++) {
-                uint64_t hash = h1 + i * h2;
-                uint64_t bit_index = hash & ((1ULL << BLOOM_SIZE_BITS) - 1);
-                uint64_t word_index = bit_index >> 6;
-                uint64_t bit_offset = bit_index & 63;
-                h_bloom[word_index] |= (1ULL << bit_offset);
-            }
-            count++;
-        }
-        fclose(f);
-        printf("✓ Loaded %d targets into bloom filter (%.1f MB)\n", count, BLOOM_SIZE_BYTES / 1024.0 / 1024.0);
-    }
-
-    // Copy to device constant memory
-    cudaMemcpyToSymbol(d_bloom_filter, h_bloom, BLOOM_SIZE_BYTES);
-    delete[] h_bloom;
-}
 
 static void printHash160(const char* label, const uint8_t h[20]) {
     printf("%s", label);
