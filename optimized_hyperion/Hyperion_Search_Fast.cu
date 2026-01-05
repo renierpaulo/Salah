@@ -11,15 +11,15 @@
 #include <cstring>
 #include <chrono>
 
-#define NUM_BLOCKS 8192
+#define NUM_BLOCKS 2048
 #define THREADS_PER_BLOCK 256
-#define BATCH_SIZE 256
+#define BATCH_SIZE 64
 
-// Bloom filter config (2^28 bits = 32MB)
-#define BLOOM_SIZE_BITS 28
+// Bloom filter config (2^26 bits = 8MB)
+#define BLOOM_SIZE_BITS 26
 #define BLOOM_SIZE_BYTES (1ULL << (BLOOM_SIZE_BITS - 3))
 #define BLOOM_SIZE_WORDS (BLOOM_SIZE_BYTES / 8)
-#define BLOOM_HASH_COUNT 7
+#define BLOOM_HASH_COUNT 3
 
 // Match buffer
 #define MAX_MATCHES 1024
