@@ -304,7 +304,19 @@ int main(int argc, char** argv) {
 
     int iter = 0;
     while (true) {
-        kernel_turbo<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(d_px, d_py, d_bloom, cur[0], d_cnt);
+        // Launch multiple kernels before checking - like profiler does
+        for (int k = 0; k < 10; k++) {
+            kernel_turbo<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(d_px, d_py, d_bloom, cur[0], d_cnt);
+            
+            // Advance key
+            unsigned __int128 add = kpl;
+            unsigned __int128 r0 = (unsigned __int128)cur[0] + (uint64_t)add;
+            cur[0] = (uint64_t)r0;
+            unsigned __int128 r1 = (unsigned __int128)cur[1] + (uint64_t)(r0 >> 64);
+            cur[1] = (uint64_t)r1;
+            if (r1 >> 64) { cur[2]++; if (cur[2] == 0) cur[3]++; }
+        }
+        
         cudaError_t err = cudaDeviceSynchronize();
         if (err != cudaSuccess) { 
             printf("\nCUDA Error: %s\n", cudaGetErrorString(err)); 
@@ -312,7 +324,7 @@ int main(int argc, char** argv) {
             break; 
         }
 
-        iter++;
+        iter += 10;
 
         int found;
         cudaMemcpyFromSymbol(&found, d_found, sizeof(int));
