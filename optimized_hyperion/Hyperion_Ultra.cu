@@ -290,6 +290,7 @@ int main(int argc, char** argv) {
     printf("Init OK!\n\n");
 
     printf("SEARCHING...\n\n");
+    fflush(stdout);
 
     auto start = std::chrono::steady_clock::now();
     uint64_t cur[4] = {rs[0], rs[1], rs[2], rs[3]};
@@ -298,9 +299,19 @@ int main(int argc, char** argv) {
     while (true) {
         kernel_ultra<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(d_px, d_py, d_bloom, cur[0], d_cnt);
         cudaError_t err = cudaDeviceSynchronize();
-        if (err != cudaSuccess) { printf("CUDA Error: %s\n", cudaGetErrorString(err)); break; }
+        if (err != cudaSuccess) { printf("CUDA Error: %s\n", cudaGetErrorString(err)); fflush(stdout); break; }
 
         iter++;
+        
+        // Print speed every iteration for first 5, then every 10
+        if (iter <= 5 || iter % 10 == 0) {
+            unsigned long long total;
+            cudaMemcpy(&total, d_cnt, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now - start).count();
+            printf("\r[%.2f GKeys/s] %llu keys, iter %d   ", total / elapsed / 1e9, total, iter);
+            fflush(stdout);
+        }
 
         int found;
         cudaMemcpyFromSymbol(&found, d_found, sizeof(int));
