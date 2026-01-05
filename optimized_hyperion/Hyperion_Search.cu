@@ -35,7 +35,6 @@
 #include "CUDAHash_Opt.cuh"
 
 // Device constants
-__device__ __constant__ uint64_t d_bloom_filter[BLOOM_SIZE_WORDS];
 __device__ __constant__ uint64_t d_key_high[3];
 __device__ __constant__ uint64_t d_G_multiples_x[BATCH_SIZE * 4];
 __device__ __constant__ uint64_t d_G_multiples_y[BATCH_SIZE * 4];
@@ -75,7 +74,7 @@ __device__ __host__ static __forceinline__ void add_u64_to_256(uint64_t a[4], ui
 }
 
 // Bloom filter check (device)
-__device__ __forceinline__ bool bloom_check(const uint8_t hash160[20]) {
+__device__ __forceinline__ bool bloom_check(const uint8_t hash160[20], const uint64_t* __restrict__ bloom_filter) {
     // Use first 8 bytes of hash160 as seed for multiple hash functions
     uint64_t seed = *(uint64_t*)hash160;
     uint64_t h1 = seed;
@@ -88,7 +87,7 @@ __device__ __forceinline__ bool bloom_check(const uint8_t hash160[20]) {
         uint64_t word_index = bit_index >> 6;
         uint64_t bit_offset = bit_index & 63;
         
-        if (!(d_bloom_filter[word_index] & (1ULL << bit_offset))) {
+        if (!(bloom_filter[word_index] & (1ULL << bit_offset))) {
             return false;
         }
     }
@@ -173,6 +172,7 @@ __device__ __forceinline__ void pointAddJacobianMixed_XY_Hot(const ECPointJ& P, 
 __global__ void __launch_bounds__(256, 4)
 kernel_search(
     uint64_t* __restrict__ d_px, uint64_t* __restrict__ d_py,
+    const uint64_t* __restrict__ d_bloom_filter,
     uint64_t start_key_lo, unsigned long long* __restrict__ d_count) {
     
     const unsigned tid = (unsigned)threadIdx.x;
@@ -258,7 +258,7 @@ kernel_search(
         ripemd160_opt(sha_state, h);
 
         // BLOOM FILTER CHECK
-        if (bloom_check(h)) {
+        if (bloom_check(h, d_bloom_filter)) {
             // Potential match! Store in buffer
             int idx = atomicAdd(&d_match_count, 1);
             if (idx < MAX_MATCHES) {
@@ -501,7 +501,46 @@ int main(int argc, char** argv) {
 
     printf("Initializing...\n");
     initGMultiples();
-    initBloomFilter(targets_file);
+    
+    // Allocate and initialize bloom filter in global memory
+    uint64_t* d_bloom_filter;
+    cudaMalloc(&d_bloom_filter, BLOOM_SIZE_BYTES);
+    uint64_t* h_bloom = new uint64_t[BLOOM_SIZE_WORDS];
+    memset(h_bloom, 0, BLOOM_SIZE_BYTES);
+    
+    // Load targets and populate bloom filter
+    FILE* f = fopen(targets_file, "r");
+    if (!f) {
+        printf("⚠️  Target file not found, using empty bloom filter\n");
+    } else {
+        char line[128];
+        int count = 0;
+        while (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = 0;
+            if (strlen(line) != 40) continue;
+
+            uint8_t hash160[20];
+            if (!parseHash160(line, hash160)) continue;
+
+            uint64_t seed = *(uint64_t*)hash160;
+            uint64_t h1 = seed;
+            uint64_t h2 = seed * 0x9e3779b97f4a7c15ULL;
+            
+            for (int i = 0; i < BLOOM_HASH_COUNT; i++) {
+                uint64_t hash = h1 + i * h2;
+                uint64_t bit_index = hash & ((1ULL << BLOOM_SIZE_BITS) - 1);
+                uint64_t word_index = bit_index >> 6;
+                uint64_t bit_offset = bit_index & 63;
+                h_bloom[word_index] |= (1ULL << bit_offset);
+            }
+            count++;
+        }
+        fclose(f);
+        printf("✓ Loaded %d targets into bloom filter\n", count);
+    }
+    
+    cudaMemcpy(d_bloom_filter, h_bloom, BLOOM_SIZE_BYTES, cudaMemcpyHostToDevice);
+    delete[] h_bloom;
 
     cudaMemcpyToSymbol(d_key_high, &rs[1], 24);
 
@@ -535,7 +574,7 @@ int main(int argc, char** argv) {
 
     int iteration = 0;
     while (true) {
-        kernel_search<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(d_px, d_py, batch_lo, d_cnt);
+        kernel_search<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(d_px, d_py, d_bloom_filter, batch_lo, d_cnt);
         err = cudaDeviceSynchronize();
         if (err != cudaSuccess) {
             printf("\n❌ CUDA Error: %s\n", cudaGetErrorString(err));
@@ -610,6 +649,7 @@ int main(int argc, char** argv) {
     cudaFree(d_px);
     cudaFree(d_py);
     cudaFree(d_cnt);
+    cudaFree(d_bloom_filter);
 
     return 0;
 }
