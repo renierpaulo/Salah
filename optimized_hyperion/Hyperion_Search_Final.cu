@@ -15,9 +15,9 @@
 #include <set>
 #include <string>
 
-#define NUM_BLOCKS 8192
+#define NUM_BLOCKS 2048
 #define THREADS_PER_BLOCK 256
-#define BATCH_SIZE 256
+#define BATCH_SIZE 64
 
 #define BLOOM_SIZE_BITS 26
 #define BLOOM_SIZE_BYTES (1ULL << (BLOOM_SIZE_BITS - 3))
@@ -127,8 +127,8 @@ kernel_search_final(uint64_t* __restrict__ d_px, uint64_t* __restrict__ d_py,
     uint64_t local_key = start_key_lo + (tid * BATCH_SIZE);
     unsigned long long lc = 0;
 
-    // Phase 1: Build products for batch inversion (same as profiler)
-    uint64_t products[BATCH_SIZE][4];
+    // Phase 1: Build products for batch inversion
+    uint64_t products[64][4];  // Reduced to save stack memory
     uint64_t dx[4];
     fieldSub(&d_G_multiples_x[0], base_x, dx);
     #pragma unroll
