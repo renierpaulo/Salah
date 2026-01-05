@@ -271,8 +271,8 @@ int main(int argc, char** argv) {
 
         iteration++;
 
-        // Check for matches
-        if (iteration % 10 == 0) {
+        // Check for matches every iteration for small ranges, or every 10 for large
+        if (iteration % 1 == 0) {  // Check every iteration to not miss matches
             int mc;
             cudaMemcpyFromSymbol(&mc, d_match_count, sizeof(int));
             if (mc > 0) {
