@@ -18,9 +18,9 @@
 #include <string>
 
 // OPTIMIZED CONFIGURATION
-#define NUM_BLOCKS 2048
+#define NUM_BLOCKS 1024
 #define THREADS_PER_BLOCK 256
-#define BATCH_SIZE 32  // Reduced for less register pressure
+#define BATCH_SIZE 64  // Same as working version
 
 // QUANTIZED BLOOM - smaller, faster
 #define BLOOM_SIZE_BITS 24  // 2MB instead of 8MB - better cache
@@ -156,7 +156,7 @@ kernel_search_quantized(uint64_t* __restrict__ d_px, uint64_t* __restrict__ d_py
     unsigned long long lc = 0;
 
     // Phase 1: Build products for batch inversion
-    uint64_t products[BATCH_SIZE][4];
+    uint64_t products[64][4];  // Fixed size for compiler optimization
     uint64_t dx[4];
     fieldSub(&d_G_multiples_x[0], base_x, dx);
     #pragma unroll
