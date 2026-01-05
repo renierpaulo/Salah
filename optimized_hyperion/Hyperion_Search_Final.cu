@@ -15,9 +15,9 @@
 #include <set>
 #include <string>
 
-#define NUM_BLOCKS 2048
+#define NUM_BLOCKS 4096
 #define THREADS_PER_BLOCK 256
-#define BATCH_SIZE 64
+#define BATCH_SIZE 128
 
 #define BLOOM_SIZE_BITS 26
 #define BLOOM_SIZE_BYTES (1ULL << (BLOOM_SIZE_BITS - 3))
@@ -128,7 +128,7 @@ kernel_search_final(uint64_t* __restrict__ d_px, uint64_t* __restrict__ d_py,
     unsigned long long lc = 0;
 
     // Phase 1: Build products for batch inversion
-    uint64_t products[64][4];  // Reduced to save stack memory
+    uint64_t products[128][4];  // 4KB per thread
     uint64_t dx[4];
     fieldSub(&d_G_multiples_x[0], base_x, dx);
     #pragma unroll
