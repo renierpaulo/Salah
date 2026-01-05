@@ -16,10 +16,10 @@
 #include <thread>
 #include <atomic>
 
-// STABLE HIGH PERFORMANCE CONFIG
-#define NUM_BLOCKS 4096
+// TESTED STABLE CONFIG - same as working Search_Final
+#define NUM_BLOCKS 1024
 #define THREADS_PER_BLOCK 256
-#define BATCH_SIZE 128
+#define BATCH_SIZE 64
 
 #define BLOOM_SIZE_BITS 26
 #define BLOOM_SIZE_BYTES (1ULL << (BLOOM_SIZE_BITS - 3))
@@ -133,7 +133,7 @@ __global__ void kernel_search_fast(uint64_t* __restrict__ d_px, uint64_t* __rest
     unsigned long long lc = 0;
 
     // Phase 1: Build products for batch inversion
-    uint64_t products[128][4];  // Fixed size to avoid stack issues
+    uint64_t products[64][4];  // Fixed size matching BATCH_SIZE
     uint64_t dx[4];
     fieldSub(&d_G_multiples_x[0], base_x, dx);
     #pragma unroll
