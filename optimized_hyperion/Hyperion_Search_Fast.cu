@@ -13,7 +13,7 @@
 
 #define NUM_BLOCKS 2048
 #define THREADS_PER_BLOCK 256
-#define BATCH_SIZE 64
+#define BATCH_SIZE 256
 
 // Bloom filter config (2^26 bits = 8MB)
 #define BLOOM_SIZE_BITS 26
@@ -143,7 +143,7 @@ __device__ void batchInvBlock(uint64_t* z_array, uint64_t* inv_array, int count)
     const int tid = threadIdx.x;
     
     // Shared memory for product tree
-    __shared__ uint64_t products[BATCH_SIZE * 4];
+    __shared__ uint64_t products[256 * 4];
     
     // Step 1: Build product tree (each thread computes cumulative product)
     if (tid < count) {
