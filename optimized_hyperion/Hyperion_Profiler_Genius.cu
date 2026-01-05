@@ -27,6 +27,33 @@
 #include "CUDAMath_WorldClass.h"
 #include "CUDAHash_Opt.cuh"
 
+static void printHash160(const char* label, const uint8_t h[20]) {
+    printf("%s", label);
+    for (int i = 0; i < 20; i++) printf("%02x", (unsigned)h[i]);
+    printf("\n");
+}
+
+__global__ void kernel_samples_hash160(const uint64_t* __restrict__ keys, uint8_t* __restrict__ out_hash20, int count) {
+    const int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (tid >= count) return;
+
+    uint64_t key[4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) key[i] = keys[tid * 4 + i];
+
+    uint64_t ox[4], oy[4];
+    scalarMulBaseAffine(key, ox, oy);
+
+    uint32_t sha_state[8];
+    sha256_opt(ox[0], ox[1], ox[2], ox[3], (oy[0] & 1) ? 0x03 : 0x02, sha_state);
+
+    uint8_t h[20];
+    ripemd160_opt(sha_state, h);
+
+    #pragma unroll
+    for (int i = 0; i < 20; i++) out_hash20[tid * 20 + i] = h[i];
+}
+
 #ifndef PROFILER_ECC_ONLY
 #define PROFILER_ECC_ONLY 1
 #endif
@@ -621,6 +648,51 @@ int main(int argc, char** argv) {
     printf("║      Usando melhor versão (2.07 GKeys/s) + Profiling       ║\n");
     printf("╚══════════════════════════════════════════════════════════════╝\n\n");
     
+    if (argc >= 2 && strcmp(argv[1], "--samples") == 0) {
+        int count = 5;
+        if (argc >= 3) count = atoi(argv[2]);
+        if (count < 1) count = 1;
+        if (count > 64) count = 64;
+
+        initGMultiples();
+
+        uint64_t h_keys[64 * 4] = {0};
+        for (int i = 0; i < count; i++) {
+            h_keys[i * 4 + 0] = (uint64_t)(i + 1);
+            h_keys[i * 4 + 1] = 0;
+            h_keys[i * 4 + 2] = 0;
+            h_keys[i * 4 + 3] = 0;
+        }
+
+        uint64_t* d_keys = nullptr;
+        uint8_t* d_hash = nullptr;
+        cudaMalloc(&d_keys, (size_t)count * 4 * sizeof(uint64_t));
+        cudaMalloc(&d_hash, (size_t)count * 20 * sizeof(uint8_t));
+        cudaMemcpy(d_keys, h_keys, (size_t)count * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice);
+
+        kernel_samples_hash160<<<1, 64>>>(d_keys, d_hash, count);
+        cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            printf("❌ CUDA Error during samples: %s\n", cudaGetErrorString(err));
+            return 1;
+        }
+
+        uint8_t h_hash[64 * 20] = {0};
+        cudaMemcpy(h_hash, d_hash, (size_t)count * 20 * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+
+        printf("Samples (privkey -> hash160, compressed pubkey):\n");
+        for (int i = 0; i < count; i++) {
+            uint64_t k[4] = { h_keys[i*4+0], h_keys[i*4+1], h_keys[i*4+2], h_keys[i*4+3] };
+            printKey256("  priv=0x", k);
+            printHash160("  hash160=", &h_hash[i * 20]);
+            printf("\n");
+        }
+
+        cudaFree(d_keys);
+        cudaFree(d_hash);
+        return 0;
+    }
+
     const char *hx = "f6f5431d25bbf7b12e8add9af5e3475c44a0a5b8";
     const char *range = "1:100000";
     
