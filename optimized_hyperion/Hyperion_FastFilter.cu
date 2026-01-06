@@ -240,35 +240,15 @@ kernel_fastfilter(uint64_t* __restrict__ d_px, uint64_t* __restrict__ d_py,
     }
 }
 
-// Build bloom filter from target's potential X coordinates
+// Build bloom filter - set ALL bits to 1 to guarantee no false negatives
+// This means we check every hash but still benefit from ECC optimizations
 void buildBloomFilter(uint8_t* h_bloom, const uint8_t target[20]) {
-    memset(h_bloom, 0, BLOOM_SIZE);
+    // Set all bits to 1 - this means bloom_check_x always returns true
+    // So we compute hash for every point (guaranteed correct)
+    // The speedup comes from ECC optimizations, not from skipping hashes
+    memset(h_bloom, 0xFF, BLOOM_SIZE);
     
-    // For a real implementation, we'd precompute X coordinates that could
-    // lead to this hash. For now, we just set random bits to simulate
-    // a low false positive rate.
-    
-    // Set ~0.1% of bits (very sparse filter)
-    srand(42);
-    for(int i = 0; i < BLOOM_SIZE * 8 / 1000; i++) {
-        int bit = rand() % (BLOOM_SIZE * 8);
-        h_bloom[bit >> 3] |= (1 << (bit & 7));
-    }
-    
-    // Also add patterns based on target hash
-    uint32_t t0 = *(uint32_t*)target;
-    uint32_t t1 = *(uint32_t*)(target + 4);
-    
-    // Add some bits based on target to ensure we don't miss real matches
-    for(int i = 0; i < 256; i++) {
-        uint32_t h1 = (t0 + i * 12345) & 0xFFFFF;
-        uint32_t h2 = (t1 + i * 67890) & 0xFFFFF;
-        h_bloom[h1 >> 3] |= (1 << (h1 & 7));
-        h_bloom[h2 >> 3] |= (1 << (h2 & 7));
-    }
-    
-    printf("Bloom filter built (%.2f%% bits set)\n", 
-           100.0 * __builtin_popcountll(*(uint64_t*)h_bloom) / 64.0);
+    printf("Bloom filter: ALL PASS (guaranteed correct, no false negatives)\n");
 }
 
 __global__ void compute_g_multiples(uint64_t* gx, uint64_t* gy) {
