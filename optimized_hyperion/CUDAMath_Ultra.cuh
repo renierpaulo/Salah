@@ -82,36 +82,33 @@ __device__ __forceinline__ void fieldAdd_Ultra(const uint64_t a[4], const uint64
     r[0] = s0; r[1] = s1; r[2] = s2; r[3] = s3;
 }
 
-// Ultra-fast 256-bit subtraction mod p
+// Ultra-fast 256-bit subtraction mod p (C++ version for compatibility)
 __device__ __forceinline__ void fieldSub_Ultra(const uint64_t a[4], const uint64_t b[4], uint64_t r[4]) {
-    uint64_t d0, d1, d2, d3;
-    uint32_t borrow = 0;
+    // Use 128-bit arithmetic for proper borrow handling
+    unsigned __int128 d0 = (unsigned __int128)a[0] - b[0];
+    unsigned __int128 d1 = (unsigned __int128)a[1] - b[1] - (d0 >> 127);
+    unsigned __int128 d2 = (unsigned __int128)a[2] - b[2] - (d1 >> 127);
+    unsigned __int128 d3 = (unsigned __int128)a[3] - b[3] - (d2 >> 127);
     
-    asm volatile(
-        "sub.cc.u64 %0, %4, %8;\n\t"
-        "subc.cc.u64 %1, %5, %9;\n\t"
-        "subc.cc.u64 %2, %6, %10;\n\t"
-        "subc.cc.u64 %3, %7, %11;\n\t"
-        "subc.u32 %12, 0, 0;"
-        : "=l"(d0), "=l"(d1), "=l"(d2), "=l"(d3), "=r"(borrow)
-        : "l"(a[0]), "l"(a[1]), "l"(a[2]), "l"(a[3]),
-          "l"(b[0]), "l"(b[1]), "l"(b[2]), "l"(b[3])
-    );
+    r[0] = (uint64_t)d0;
+    r[1] = (uint64_t)d1;
+    r[2] = (uint64_t)d2;
+    r[3] = (uint64_t)d3;
     
-    if(borrow) {
-        // Add p = subtract (2^32 + 977)
-        uint64_t adj = 0x100000000ULL + 977;
-        asm volatile(
-            "sub.cc.u64 %0, %0, %4;\n\t"
-            "subc.cc.u64 %1, %1, 0;\n\t"
-            "subc.cc.u64 %2, %2, 0;\n\t"
-            "subc.u64 %3, %3, 0;"
-            : "+l"(d0), "+l"(d1), "+l"(d2), "+l"(d3)
-            : "l"(adj)
-        );
+    // If borrow (d3 negative), add p
+    if(d3 >> 127) {
+        // Add p by subtracting (2^32 + 977) from the result conceptually
+        // p = 2^256 - 2^32 - 977, so adding p = subtracting 2^32+977 from overflow
+        const uint64_t adj = 0xFFFFFFFEFFFFFC2FULL; // p[0]
+        unsigned __int128 s0 = (unsigned __int128)r[0] + adj;
+        unsigned __int128 s1 = (unsigned __int128)r[1] + 0xFFFFFFFFFFFFFFFFULL + (s0 >> 64);
+        unsigned __int128 s2 = (unsigned __int128)r[2] + 0xFFFFFFFFFFFFFFFFULL + (s1 >> 64);
+        unsigned __int128 s3 = (unsigned __int128)r[3] + 0xFFFFFFFFFFFFFFFFULL + (s2 >> 64);
+        r[0] = (uint64_t)s0;
+        r[1] = (uint64_t)s1;
+        r[2] = (uint64_t)s2;
+        r[3] = (uint64_t)s3;
     }
-    
-    r[0] = d0; r[1] = d1; r[2] = d2; r[3] = d3;
 }
 
 // 64x64 -> 128 bit multiply using PTX
