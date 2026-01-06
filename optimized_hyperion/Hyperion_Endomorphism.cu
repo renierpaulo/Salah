@@ -92,8 +92,8 @@ __global__ void init_pts(uint64_t* d_px, uint64_t* d_py, uint64_t s0, uint64_t s
     const uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t key[4] = {s0, s1, s2, s3};
     
-    // Each thread handles BATCH_SIZE * 3 keys (original + 2 endomorphism variants)
-    unsigned __int128 total_off = (unsigned __int128)tid * BATCH_SIZE * 3;
+    // Each thread handles BATCH_SIZE * 6 keys (3 endomorphism × 2 parities)
+    unsigned __int128 total_off = (unsigned __int128)tid * BATCH_SIZE * 6;
     unsigned __int128 r0 = (unsigned __int128)key[0] + (uint64_t)total_off;
     key[0] = (uint64_t)r0;
     unsigned __int128 r1 = (unsigned __int128)key[1] + (uint64_t)(r0 >> 64);
@@ -127,8 +127,8 @@ kernel_endomorphism(uint64_t* __restrict__ d_px, uint64_t* __restrict__ d_py,
         base_y[i] = d_py[tid*4 + i];
     }
 
-    // Each iteration covers 3 keys due to endomorphism
-    uint64_t local_key = start_key_lo + (tid * BATCH_SIZE * 3);
+    // Each iteration covers 6 keys due to endomorphism + negation
+    uint64_t local_key = start_key_lo + (tid * BATCH_SIZE * 6);
     unsigned long long lc = 0;
 
     // Batch inversion products
@@ -186,87 +186,115 @@ kernel_endomorphism(uint64_t* __restrict__ d_px, uint64_t* __restrict__ d_py,
         fieldMul(lambda, temp, y3);
         fieldSub(y3, base_y, y3);
 
-        // === POINT 1: Original point P = (x3, y3) ===
+        // Compute endomorphism variants ONCE
+        uint64_t x3_lambda[4], x3_lambda2[4];
+        fieldMul(x3, BETA, x3_lambda);
+        fieldMul(x3, BETA_SQ, x3_lambda2);
+        
+        // Get parity
+        uint8_t parity_even = 0x02;
+        uint8_t parity_odd = 0x03;
+        uint8_t y_parity = (y3[0] & 1) ? parity_odd : parity_even;
+        uint8_t y_parity_neg = (y3[0] & 1) ? parity_even : parity_odd;
+
+        // === POINT 1: P = (x3, y3) ===
         {
             uint32_t sha_state[8];
-            sha256_opt(x3[0], x3[1], x3[2], x3[3], (y3[0] & 1) ? 0x03 : 0x02, sha_state);
-            
+            sha256_opt(x3[0], x3[1], x3[2], x3[3], y_parity, sha_state);
             uint8_t hash[20];
             ripemd160_opt(sha_state, hash);
-            
             lc++;
-            
             if (*(uint32_t*)hash == d_prefix) {
                 bool match = true;
-                #pragma unroll
-                for(int k=0; k<20; k++) {
-                    if(hash[k] != d_target[k]) { match = false; break; }
-                }
+                for(int k=0; k<20; k++) if(hash[k] != d_target[k]) { match = false; break; }
                 if (match && atomicCAS(&d_found, 0, 1) == 0) {
-                    d_found_key[0] = local_key + i * 3 + 1;
-                    d_found_key[1] = d_key_high[0];
-                    d_found_key[2] = d_key_high[1];
-                    d_found_key[3] = d_key_high[2];
+                    d_found_key[0] = local_key + i * 6 + 1;
+                    d_found_key[1] = d_key_high[0]; d_found_key[2] = d_key_high[1]; d_found_key[3] = d_key_high[2];
                 }
             }
         }
-
-        // === POINT 2: λ*P = (β*x3, y3) - ALMOST FREE! ===
+        // === POINT 2: -P = (x3, -y3) - FREE! Just flip parity ===
         {
-            uint64_t x3_lambda[4];
-            fieldMul(x3, BETA, x3_lambda);  // Just one multiplication!
-            
             uint32_t sha_state[8];
-            sha256_opt(x3_lambda[0], x3_lambda[1], x3_lambda[2], x3_lambda[3], 
-                      (y3[0] & 1) ? 0x03 : 0x02, sha_state);
-            
+            sha256_opt(x3[0], x3[1], x3[2], x3[3], y_parity_neg, sha_state);
             uint8_t hash[20];
             ripemd160_opt(sha_state, hash);
-            
             lc++;
-            
             if (*(uint32_t*)hash == d_prefix) {
                 bool match = true;
-                #pragma unroll
-                for(int k=0; k<20; k++) {
-                    if(hash[k] != d_target[k]) { match = false; break; }
-                }
+                for(int k=0; k<20; k++) if(hash[k] != d_target[k]) { match = false; break; }
                 if (match && atomicCAS(&d_found, 0, 1) == 0) {
-                    // Key for this point is λ * original_key mod n
-                    d_found_key[0] = local_key + i * 3 + 2;
-                    d_found_key[1] = d_key_high[0];
-                    d_found_key[2] = d_key_high[1];
-                    d_found_key[3] = d_key_high[2] | 0x8000000000000000ULL; // Mark as λ variant
+                    d_found_key[0] = local_key + i * 6 + 2;
+                    d_found_key[1] = d_key_high[0]; d_found_key[2] = d_key_high[1]; 
+                    d_found_key[3] = d_key_high[2] | 0x1000000000000000ULL; // Mark as -P
                 }
             }
         }
-
-        // === POINT 3: λ²*P = (β²*x3, y3) - ALMOST FREE! ===
+        // === POINT 3: λP = (βx3, y3) ===
         {
-            uint64_t x3_lambda2[4];
-            fieldMul(x3, BETA_SQ, x3_lambda2);  // Just one multiplication!
-            
             uint32_t sha_state[8];
-            sha256_opt(x3_lambda2[0], x3_lambda2[1], x3_lambda2[2], x3_lambda2[3], 
-                      (y3[0] & 1) ? 0x03 : 0x02, sha_state);
-            
+            sha256_opt(x3_lambda[0], x3_lambda[1], x3_lambda[2], x3_lambda[3], y_parity, sha_state);
             uint8_t hash[20];
             ripemd160_opt(sha_state, hash);
-            
             lc++;
-            
             if (*(uint32_t*)hash == d_prefix) {
                 bool match = true;
-                #pragma unroll
-                for(int k=0; k<20; k++) {
-                    if(hash[k] != d_target[k]) { match = false; break; }
-                }
+                for(int k=0; k<20; k++) if(hash[k] != d_target[k]) { match = false; break; }
                 if (match && atomicCAS(&d_found, 0, 1) == 0) {
-                    // Key for this point is λ² * original_key mod n
-                    d_found_key[0] = local_key + i * 3 + 3;
-                    d_found_key[1] = d_key_high[0];
-                    d_found_key[2] = d_key_high[1];
-                    d_found_key[3] = d_key_high[2] | 0x4000000000000000ULL; // Mark as λ² variant
+                    d_found_key[0] = local_key + i * 6 + 3;
+                    d_found_key[1] = d_key_high[0]; d_found_key[2] = d_key_high[1]; 
+                    d_found_key[3] = d_key_high[2] | 0x8000000000000000ULL;
+                }
+            }
+        }
+        // === POINT 4: -λP = (βx3, -y3) ===
+        {
+            uint32_t sha_state[8];
+            sha256_opt(x3_lambda[0], x3_lambda[1], x3_lambda[2], x3_lambda[3], y_parity_neg, sha_state);
+            uint8_t hash[20];
+            ripemd160_opt(sha_state, hash);
+            lc++;
+            if (*(uint32_t*)hash == d_prefix) {
+                bool match = true;
+                for(int k=0; k<20; k++) if(hash[k] != d_target[k]) { match = false; break; }
+                if (match && atomicCAS(&d_found, 0, 1) == 0) {
+                    d_found_key[0] = local_key + i * 6 + 4;
+                    d_found_key[1] = d_key_high[0]; d_found_key[2] = d_key_high[1]; 
+                    d_found_key[3] = d_key_high[2] | 0x9000000000000000ULL;
+                }
+            }
+        }
+        // === POINT 5: λ²P = (β²x3, y3) ===
+        {
+            uint32_t sha_state[8];
+            sha256_opt(x3_lambda2[0], x3_lambda2[1], x3_lambda2[2], x3_lambda2[3], y_parity, sha_state);
+            uint8_t hash[20];
+            ripemd160_opt(sha_state, hash);
+            lc++;
+            if (*(uint32_t*)hash == d_prefix) {
+                bool match = true;
+                for(int k=0; k<20; k++) if(hash[k] != d_target[k]) { match = false; break; }
+                if (match && atomicCAS(&d_found, 0, 1) == 0) {
+                    d_found_key[0] = local_key + i * 6 + 5;
+                    d_found_key[1] = d_key_high[0]; d_found_key[2] = d_key_high[1]; 
+                    d_found_key[3] = d_key_high[2] | 0x4000000000000000ULL;
+                }
+            }
+        }
+        // === POINT 6: -λ²P = (β²x3, -y3) ===
+        {
+            uint32_t sha_state[8];
+            sha256_opt(x3_lambda2[0], x3_lambda2[1], x3_lambda2[2], x3_lambda2[3], y_parity_neg, sha_state);
+            uint8_t hash[20];
+            ripemd160_opt(sha_state, hash);
+            lc++;
+            if (*(uint32_t*)hash == d_prefix) {
+                bool match = true;
+                for(int k=0; k<20; k++) if(hash[k] != d_target[k]) { match = false; break; }
+                if (match && atomicCAS(&d_found, 0, 1) == 0) {
+                    d_found_key[0] = local_key + i * 6 + 6;
+                    d_found_key[1] = d_key_high[0]; d_found_key[2] = d_key_high[1]; 
+                    d_found_key[3] = d_key_high[2] | 0x5000000000000000ULL;
                 }
             }
         }
@@ -314,8 +342,8 @@ kernel_endomorphism(uint64_t* __restrict__ d_px, uint64_t* __restrict__ d_py,
 __global__ void compute_g_multiples(uint64_t* gx, uint64_t* gy) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= BATCH_SIZE) return;
-    // Compute (tid+1)*3*G to account for endomorphism spacing
-    uint64_t key[4] = {(uint64_t)((tid + 1) * 3), 0, 0, 0};
+    // Compute (tid+1)*6*G to account for 6x endomorphism spacing
+    uint64_t key[4] = {(uint64_t)((tid + 1) * 6), 0, 0, 0};
     uint64_t ox[4], oy[4];
     scalarMulBaseAffine(key, ox, oy);
     for(int i=0; i<4; i++) { gx[tid*4+i] = ox[i]; gy[tid*4+i] = oy[i]; }
@@ -364,13 +392,13 @@ int main(int argc, char** argv) {
     if (!parseHash160(target_hash, target)) { printf("Invalid hash160\n"); return 1; }
 
     uint64_t total_threads = (uint64_t)NUM_BLOCKS * THREADS_PER_BLOCK;
-    uint64_t kpl = total_threads * BATCH_SIZE * 3;  // 3x due to endomorphism!
+    uint64_t kpl = total_threads * BATCH_SIZE * 6;  // 6x: 3 endomorphism × 2 parities!
 
     printf("Target:     %s\n", target_hash);
     printKey256("Range:      0x", rs);
-    printf("Config:     %d blocks × %d threads × %d batch × 3 (endomorphism)\n", 
+    printf("Config:     %d blocks × %d threads × %d batch × 6 (endo+neg)\n", 
            NUM_BLOCKS, THREADS_PER_BLOCK, BATCH_SIZE);
-    printf("Keys/iter:  %.2f million (3x boost from endomorphism!)\n\n", kpl/1e6);
+    printf("Keys/iter:  %.2f million (6x boost: endomorphism + negation!)\n\n", kpl/1e6);
 
     printf("Initializing...\n");
     initGMultiples();
