@@ -8,9 +8,9 @@
 #include <cstring>
 #include <chrono>
 
-#define NUM_BLOCKS 4096
+#define NUM_BLOCKS 8192
 #define THREADS_PER_BLOCK 256
-#define BATCH_SIZE 128
+#define BATCH_SIZE 32
 
 #define BLOOM_SIZE_BITS 26
 #define BLOOM_SIZE_BYTES (1ULL << (BLOOM_SIZE_BITS - 3))
