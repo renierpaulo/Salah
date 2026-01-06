@@ -51,6 +51,9 @@ __device__ __constant__ uint64_t TEST_B[4] = {
     0xFD17B448A6855419ULL, 0x9C47D08FFB10D4B8ULL
 };
 
+// Prevent dead code elimination
+__device__ volatile uint64_t g_sink = 0;
+
 // Micro-profiling kernel
 __global__ void kernel_micro_profile() {
     const int tid = threadIdx.x + blockIdx.x * blockDim.x;
@@ -62,71 +65,91 @@ __global__ void kernel_micro_profile() {
         b[i] = TEST_B[i] + tid;
     }
     
+    // Force memory barrier
+    __threadfence();
+    
     unsigned long long total_start = clock64();
     
     // ============ PROFILE fieldMul ============
+    __threadfence();
     unsigned long long start = clock64();
-    #pragma unroll
     for(int i = 0; i < TEST_ITERATIONS; i++) {
         fieldMul(a, b, c);
-        a[0] ^= c[0]; // Prevent optimization
+        a[0] += c[0]; // Prevent optimization
+        a[1] += c[1];
     }
+    __threadfence();
     unsigned long long cycles_mul = clock64() - start;
+    g_sink += c[0]; // Force result to be used
     
     // ============ PROFILE fieldSqr ============
+    __threadfence();
     start = clock64();
-    #pragma unroll
     for(int i = 0; i < TEST_ITERATIONS; i++) {
         fieldSqr(a, c);
-        a[0] ^= c[0];
+        a[0] += c[0];
+        a[1] += c[1];
     }
+    __threadfence();
     unsigned long long cycles_sqr = clock64() - start;
+    g_sink += c[0];
     
     // ============ PROFILE fieldSub ============
+    __threadfence();
     start = clock64();
-    #pragma unroll
     for(int i = 0; i < TEST_ITERATIONS; i++) {
         fieldSub(a, b, c);
-        a[0] ^= c[0];
+        a[0] += c[0];
     }
+    __threadfence();
     unsigned long long cycles_sub = clock64() - start;
+    g_sink += c[0];
     
     // ============ PROFILE fieldAdd ============
+    __threadfence();
     start = clock64();
-    #pragma unroll
     for(int i = 0; i < TEST_ITERATIONS; i++) {
         fieldAdd(a, b, c);
-        a[0] ^= c[0];
+        a[0] += c[0];
     }
+    __threadfence();
     unsigned long long cycles_add = clock64() - start;
+    g_sink += c[0];
     
     // ============ PROFILE fieldInv (Fermat) ============
+    __threadfence();
     start = clock64();
-    for(int i = 0; i < 10; i++) { // Only 10 iterations (expensive!)
+    for(int i = 0; i < 10; i++) {
         fieldInv_Fermat(a, c);
-        a[0] ^= c[0];
+        a[0] += c[0];
     }
+    __threadfence();
     unsigned long long cycles_inv = clock64() - start;
+    g_sink += c[0];
     
     // ============ PROFILE SHA256 ============
     uint32_t sha_state[8];
+    __threadfence();
     start = clock64();
-    #pragma unroll
     for(int i = 0; i < TEST_ITERATIONS; i++) {
         sha256_opt(a[0], a[1], a[2], a[3], 0x02, sha_state);
-        a[0] ^= sha_state[0];
+        a[0] += sha_state[0];
     }
+    __threadfence();
     unsigned long long cycles_sha = clock64() - start;
+    g_sink += sha_state[0];
     
     // ============ PROFILE RIPEMD160 ============
     uint8_t hash[20];
+    __threadfence();
     start = clock64();
-    #pragma unroll
     for(int i = 0; i < TEST_ITERATIONS; i++) {
         ripemd160_opt(sha_state, hash);
-        a[0] ^= hash[0];
+        a[0] += hash[0];
     }
+    __threadfence();
     unsigned long long cycles_ripemd = clock64() - start;
+    g_sink += hash[0];
     
     unsigned long long total_end = clock64();
     
