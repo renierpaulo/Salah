@@ -23,6 +23,7 @@
 #endif
 
 #include "CUDAUtils.h"
+#include "CUDAMath_Jacobian_Fixed.h"  // For scalarMulBaseAffine
 #include "CUDAMath_Ultra.cuh"  // New optimized math!
 #include "CUDAMath_WorldClass.h"
 #include "CUDAHash_Opt.cuh"
