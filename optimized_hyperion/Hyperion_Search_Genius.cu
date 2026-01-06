@@ -38,6 +38,14 @@ static __forceinline__ int cmp256_le(const uint64_t a[4], const uint64_t b[4]) {
     return 0;
 }
 
+static __forceinline__ void add_u64_to_256(uint64_t x[4], uint64_t v) {
+    unsigned __int128 r0 = (unsigned __int128)x[0] + v;
+    x[0] = (uint64_t)r0;
+    unsigned __int128 r1 = (unsigned __int128)x[1] + (uint64_t)(r0 >> 64);
+    x[1] = (uint64_t)r1;
+    if (r1 >> 64) { x[2]++; if (x[2] == 0) x[3]++; }
+}
+
 // Init points - one per thread
 __global__ void init_pts(uint64_t* d_px, uint64_t* d_py, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t s3) {
     const uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
